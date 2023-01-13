@@ -1,23 +1,26 @@
+import base64
 import datetime as dt
-import dill
 import json
-import kafka
-import fastapi
 
-from api import db
-from api import feature_sets
-from api import models
-from api import processors
-from api import sinks
-from api import tasks
-from api import targets
-from api import runners
-import psycopg
-import sqlmodel as sqlm
 import celery
+import dill
+import fastapi
+import kafka
+import sqlmodel as sqlm
+from fastapi.encoders import jsonable_encoder
+
+from api import (  # isort:skip
+    db,
+    feature_sets,
+    models,
+    processors,
+    runners,
+    sinks,
+    targets,
+    tasks,
+)
 
 router = fastapi.APIRouter()
-
 
 RUNNER = celery.Celery("experiments", broker="redis://redis:6379/0")
 
@@ -75,7 +78,7 @@ def run_training(experiment_id):
             p.feature_set
         FROM {target.name} t
         INNER JOIN predictions_{experiment_id} p ON
-            t.{target.key_field} = CAST(p.key AS INTEGER)
+            CAST(t.{target.key_field} as INTEGER) = CAST(p.key AS INTEGER)
     )
     """
     )
@@ -101,7 +104,7 @@ def run_training(experiment_id):
                 model_last_dumped_at = now
 
 
-class Experiment(sqlm.SQLModel, table=True):
+class Experiment(sqlm.SQLModel, table=True):  # type: ignore[call-arg]
     id: int | None = sqlm.Field(default=None, primary_key=True)
     name: str
     model_state: bytes | None = sqlm.Field(default=None)
@@ -187,33 +190,6 @@ class Experiment(sqlm.SQLModel, table=True):
             )
 
         elif target.task == tasks.TaskEnum.regression:
-            print(
-                f"""
-    DROP VIEW IF EXISTS predictions_{self.id};
-    DROP VIEW IF EXISTS predictions_raw_{self.id};
-    DROP SOURCE IF EXISTS predictions_src_{self.id};
-
-    CREATE MATERIALIZED SOURCE predictions_src_{self.id}
-    FROM KAFKA BROKER '{sink.url}' TOPIC 'predictions_{self.id}'
-    KEY FORMAT BYTES
-    VALUE FORMAT BYTES
-    INCLUDE KEY AS key;
-
-    CREATE VIEW predictions_raw_{self.id} AS (
-        SELECT
-            CONVERT_FROM(key, 'utf8') AS key,
-            CAST(CONVERT_FROM(data, 'utf8') AS FLOAT) AS prediction
-        FROM predictions_src_{self.id}
-    );
-
-    CREATE VIEW predictions_{self.id} AS (
-        SELECT
-            key,
-            CAST(prediction ->> 'feature_set' AS JSONB) AS feature_set,
-            prediction
-        FROM predictions_raw_{self.id}
-    )"""
-            )
             processor.execute(
                 f"""
     DROP VIEW IF EXISTS predictions_{self.id};
@@ -229,7 +205,7 @@ class Experiment(sqlm.SQLModel, table=True):
     CREATE VIEW predictions_raw_{self.id} AS (
         SELECT
             CONVERT_FROM(key, 'utf8') AS key,
-            CAST(CONVERT_FROM(data, 'utf8') AS FLOAT) AS prediction
+            CAST(CONVERT_FROM(data, 'utf8') AS JSONB) AS prediction
         FROM predictions_src_{self.id}
     );
 
@@ -237,7 +213,7 @@ class Experiment(sqlm.SQLModel, table=True):
         SELECT
             key,
             CAST(prediction ->> 'feature_set' AS JSONB) AS feature_set,
-            prediction
+            CAST(prediction ->> 'prediction' AS JSONB) AS prediction
         FROM predictions_raw_{self.id}
     )"""
             )
@@ -249,7 +225,6 @@ class Experiment(sqlm.SQLModel, table=True):
 
         with db.session() as session:
             target = session.get(targets.Target, self.target_id)
-            sink = session.get(sinks.Sink, self.sink_id)
             processor = session.get(processors.Processor, target.processor_id)
 
         if target.task == tasks.TaskEnum.binary_clf.value:
@@ -276,28 +251,27 @@ class Experiment(sqlm.SQLModel, table=True):
                     CAST(p.prediction ->> 'true' AS FLOAT) > 0.5 AS y_pred
                 FROM predictions_{self.id} p
                 INNER JOIN {target.name} y ON
-                    y.{target.key_field} = CAST(p.key AS INTEGER)
+                    CAST(y.{target.key_field} AS INTEGER) = CAST(p.key AS INTEGER)
             )
         )
     )"""
             )
 
         elif target.task == tasks.TaskEnum.regression:
-
             processor.execute(
                 f"""
     CREATE VIEW performance_{self.id} AS (
         SELECT
-            AVG(POW(y_true - y_pred, 2) AS mse,
+            AVG(POW(y_true - y_pred, 2)) AS mse,
             AVG(ABS(y_true - y_pred)) AS mae
         FROM (
             -- Labels <> predictions
             SELECT
                 y.{target.target_field} AS y_true,
-                CAST(p.prediction ->> 'true' AS FLOAT) AS y_pred
+                CAST(p.prediction AS FLOAT) AS y_pred
             FROM predictions_{self.id} p
             INNER JOIN {target.name} y ON
-                y.{target.key_field} = CAST(p.key AS INTEGER)
+                CAST(y.{target.key_field} AS INTEGER) = CAST(p.key AS INTEGER)
         )
     )"""
             )
@@ -309,7 +283,13 @@ class Experiment(sqlm.SQLModel, table=True):
 @router.post("/")
 def create_experiment(experiment: Experiment):
     with db.session() as session:
-        return experiment.create(session)
+        exp = experiment.create(session)
+        # model_content needs to be encoded if we want to return it here
+        exp.model_state = jsonable_encoder(
+            exp.model_state,
+            custom_encoder={bytes: lambda v: base64.b64encode(v).decode("utf-8")},
+        )
+        return exp
 
 
 @router.get("/")
@@ -330,7 +310,7 @@ def read_experiments(offset: int = 0, limit: int = fastapi.Query(default=100, lt
         ).all()
 
 
-@router.get("/{experiment_id}")
+@router.get("/{experiment_id}", response_model=Experiment)
 def read_experiment(experiment_id: int):
     with db.session() as session:
         experiment = session.exec(
