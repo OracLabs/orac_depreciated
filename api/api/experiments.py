@@ -160,13 +160,18 @@ class Experiment(sqlm.SQLModel, table=True):  # type: ignore[call-arg]
             processor = session.get(processors.Processor, target.processor_id)
 
         if target.task == tasks.TaskEnum.binary_clf.value:
+            prediction_type = "JSONB"
+        elif target.task == tasks.TaskEnum.regression:
+            prediction_type = "FLOAT"
+        else:
+            raise NotImplementedError
 
-            processor.execute(
-                f"""
+        drop_views = f"""
     DROP VIEW IF EXISTS predictions_{self.id};
     DROP VIEW IF EXISTS predictions_raw_{self.id};
-    DROP SOURCE IF EXISTS predictions_src_{self.id};
+    DROP SOURCE IF EXISTS predictions_src_{self.id};"""
 
+        create_views = f"""
     CREATE MATERIALIZED SOURCE predictions_src_{self.id}
     FROM KAFKA BROKER '{sink.url}' TOPIC 'predictions_{self.id}'
     KEY FORMAT BYTES
@@ -184,38 +189,25 @@ class Experiment(sqlm.SQLModel, table=True):  # type: ignore[call-arg]
         SELECT
             key,
             CAST(prediction ->> 'feature_set' AS JSONB) AS feature_set,
-            CAST(prediction ->> 'prediction' AS JSONB) AS prediction
+            CAST(prediction ->> 'prediction' AS {prediction_type}) AS prediction
         FROM predictions_raw_{self.id}
     )"""
+
+        if target.task == tasks.TaskEnum.binary_clf.value:
+
+            processor.execute(
+                f"""
+    {drop_views}
+    {create_views}
+    """
             )
 
         elif target.task == tasks.TaskEnum.regression:
             processor.execute(
                 f"""
-    DROP VIEW IF EXISTS predictions_{self.id};
-    DROP VIEW IF EXISTS predictions_raw_{self.id};
-    DROP SOURCE IF EXISTS predictions_src_{self.id};
-
-    CREATE MATERIALIZED SOURCE predictions_src_{self.id}
-    FROM KAFKA BROKER '{sink.url}' TOPIC 'predictions_{self.id}'
-    KEY FORMAT BYTES
-    VALUE FORMAT BYTES
-    INCLUDE KEY AS key;
-
-    CREATE VIEW predictions_raw_{self.id} AS (
-        SELECT
-            CONVERT_FROM(key, 'utf8') AS key,
-            CAST(CONVERT_FROM(data, 'utf8') AS JSONB) AS prediction
-        FROM predictions_src_{self.id}
-    );
-
-    CREATE VIEW predictions_{self.id} AS (
-        SELECT
-            key,
-            CAST(prediction ->> 'feature_set' AS JSONB) AS feature_set,
-            CAST(prediction ->> 'prediction' AS JSONB) AS prediction
-        FROM predictions_raw_{self.id}
-    )"""
+    {drop_views}
+    {create_views}
+    """
             )
 
         else:
