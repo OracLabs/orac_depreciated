@@ -193,16 +193,11 @@ class Experiment(sqlm.SQLModel, table=True):  # type: ignore[call-arg]
         FROM predictions_raw_{self.id}
     )"""
 
-        if target.task == tasks.TaskEnum.binary_clf.value:
+        if (
+            target.task == tasks.TaskEnum.binary_clf.value
+            or target.task == tasks.TaskEnum.regression
+        ):
 
-            processor.execute(
-                f"""
-    {drop_views}
-    {create_views}
-    """
-            )
-
-        elif target.task == tasks.TaskEnum.regression:
             processor.execute(
                 f"""
     {drop_views}
