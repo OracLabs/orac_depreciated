@@ -263,6 +263,19 @@ class Experiment(sqlm.SQLModel, table=True):  # type: ignore[call-arg]
     )"""
             )
 
+            # not final, still testing...
+            # topic that's being created is
+            # "performance_2_topic-u27-1674162340-9037993907767384116"
+            # which is weird
+            sink_query = f"""
+                      CREATE SINK performance_{self.id}_sink
+            FROM performance_{self.id}
+            INTO KAFKA BROKER 'redpanda:29092' TOPIC 'performance_{self.id}_topic'
+            FORMAT JSON
+
+            """
+            processor.execute(sink_query)
+
         else:
             raise NotImplementedError
 
